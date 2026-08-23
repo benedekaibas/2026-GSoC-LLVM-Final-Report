@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta http-equiv="X-UA-Compatible" content="chrome=1" />
+        <title>Teach the Clang Static Analyzer to understand lifetime annotations | GSoC @ LLVM 2026</title>
+        <link rel="icon" href="./favicon.ico" />
+        <link rel="stylesheet" href="stylesheets/styles.css" />
+        <link rel="stylesheet" href="stylesheets/pygment_trac.css" />
+        <meta name="viewport" content="width=device-width" />
+    </head>
+    <body>
+        <div class="wrapper">
+            <header>
+                <a href="?">
+                    <img src="./img/LLVMWyvernBig.png" />
+                </a>
+            </header>
+            <section>
+                <h1>Teach the Clang Static Analyzer to understand lifetime annotations</h1>
+                <h3><a href="https://summerofcode.withgoogle.com/programs/2026/projects/FVArxbU6" target="_blank">Google Summer of Code 2026</a> @ <a href="https://llvm.org/" target="_blank">LLVM Compiler Infrastructure</a></h3>
+                <p>
+                    <span class="nameContainer"><strong>Benedek Kaibás</strong></span>
+                    Allegheny College, United States
+                    <br />
+                    <a href="https://github.com/llvm/llvm-project/commits?author=benedekaibas" target="_blank">Commits on GitHub</a> | <a href="https://github.com/llvm/llvm-project/pulls?q=is%3Apr+author%3Abenedekaibas" target="_blank">Pull requests</a>
+                </p>
+                <h2>Motivation</h2>
+
+                <p>Around 70% of the severe security bugs at Microsoft and in Chromium come from memory safety violations [2][3], and in 2022 the NSA recommended moving away from memory unsafe languages such as C and C++ [1], a recommendation the White House repeated in 2024 [4]. Many of them are lifetime errors, where a pointer or a reference outlives the object it points to. Rewriting the C++ that is already out there is rarely practical, so these bugs have to be caught in the code as it is. The Clang Static Analyzer reasons about the paths of a program without running it and teaching it to understand lifetime annotations lets it catch dangling pointers and references the compiler cannot detect.</p>
+
+                <h2>Background</h2>
+
+                <p>Clang has a lifetime analysis behind the <code>-Wlifetime-safety</code> flag [7], inspired by Rust's Polonius borrow checker. It works with an Origins and Loans model. An origin is the set of memory locations a pointer may refer to and a loan is a single act of borrowing from one. Together they tell whether a pointer still refers to something alive. The analysis also reads lifetime annotations such as <code>[[clang::lifetimebound]]</code> and <code>[[clang::lifetime_capture_by(X)]]</code> [10]. <code>-Wlifetime-safety</code> has to run on every translation unit of every build, so it is intra-procedural. That makes a single missing annotation enough to hide a bug. Once the value travels through an unannotated function in the chain, the analysis treats it as opaque and stays silent. This project closes that gap by teaching the CSA to read the same annotations and to follow the lifetime through the function chain by inlining.</p>
+
+                <p><code>-Wlifetime-safety</code> is intra-procedural because it has to run on every translation unit of every build. A single missing annotation in the chain is then enough to hide a bug. The CSA has no such limit which means it can inline the callee and follow the lifetime through the chain.</p>
+
+                <p>The following example shows the difference:</p>
+
+<div class="highlight"><pre><span></span><span class="c1">// Defined in another translation unit.</span>
+<span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="nf">findHeader</span><span class="p">(</span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">buffer</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]],</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">name</span><span class="p">);</span>
+
+<span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="nf">contentTypeOf</span><span class="p">(</span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">buffer</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">findHeader</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Content-Type&quot;</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+
+<span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="nf">parseResponse</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">contentTypeOf</span><span class="p">(</span><span class="n">buffer</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p>Only <code>findHeader</code> is annotated so the compiler has nothing to work with:</p>
+
+<pre><code>$ clang --analyze -Xclang -analyzer-checker=core,alpha.cplusplus.UseAfterLifetimeEnd \
+        -Xclang -analyzer-output=text header-parse.cpp</code></pre>
+
+                <p>The CSA inlines <code>contentTypeOf</code> and finds the annotated call</p>
+
+<pre><code>warning: Returning value bound to 'buffer[0]' that will go out of scope [alpha.cplusplus.UseAfterLifetimeEnd]
+    8 |   return contentTypeOf(buffer);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: Calling 'contentTypeOf'
+    8 |   return contentTypeOf(buffer);
+      |          ^~~~~~~~~~~~~~~~~~~~~
+note: Value's lifetime bound to the lifetime of 'buffer[0]' here
+    4 | char *contentTypeOf(char *buffer) { return findHeader(buffer, "Content-Type"); }
+      |                                                       ^~~~~~
+note: Returning from 'contentTypeOf'
+    8 |   return contentTypeOf(buffer);
+      |          ^~~~~~~~~~~~~~~~~~~~~
+note: Lifetime of 'buffer[0]' ended here
+    8 |   return contentTypeOf(buffer);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~</code></pre>
+
+                <h2>The goal of the project</h2>
+
+                <p>This project closes that gap by giving the CSA the same contracts the compiler reads. When the analyzer can inline a callee it follows the lifetime through the chain itself and does not need the annotation at all. When it cannot inline the callee then the annotation is what it falls back on. That combination lets it report two things the compiler stays silent about: a value that is returned while it still borrows from the frame it leaves and a pointer that is dereferenced or passed on after its object has gone out of scope. The analyzer works path by path which means every report carries the execution path that leads to the bug. The path shows where the value was borrowed and where its storage died. Both checkers are in Clang today and remain in the alpha package until they are stable. The rest of this report shows how they were built and what they catch that the compiler misses. The future work section describes what is left to do.</p>
+
+                <h2>Implementation</h2>
+
+                <h3>Where an annotation becomes something a checker can act on</h3>
+
+                <p>Two mechanical questions had to be answered first: where an annotation becomes visible to a checker and where a checker can keep what it learns.</p>
+
+                <p>Clang attaches <code>[[clang::lifetimebound]]</code> to the annotated <code>ParmVarDecl</code>, so the contract is in the AST before the analyzer starts. It becomes usable in <code>checkPostCall</code>: the call has been evaluated, so the return value and every argument have an <code>SVal</code>, and the checker can pair the returned value with the region of the argument it borrows from.</p>
+
+                <p>That pair goes into the program state. Next to the store and the constraints, every <code>ProgramState</code> carries a generic data map, a key-value area where a checker registers a container of its own. What lives there is path specific: it is duplicated when a branch splits the exploration and dropped when the analyzer backtracks, so a borrow that only exists when a condition holds stays on that branch. That is the property the whole project rests on.</p>
+
+                <p>Both halves are visible on the smallest example there is:</p>
+
+<div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">test_func</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]]);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">variable_return</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">test_func</span><span class="p">(</span><span class="o">&amp;</span><span class="n">y</span><span class="p">);</span><span class="w">   </span><span class="c1">// (1)</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">p</span><span class="p">;</span><span class="w">                 </span><span class="c1">// (2)</span>
+<span class="p">}</span>
+</pre></div>
+
+<pre><code>  (1) LifetimeModeling::checkPostCall fires on the call to 'test_func'
+
+      The callee's parameter carries the attribute, the argument has a region
+      and the call has a return value, so the pair is written into the state:
+
+      ProgramState of this node
+      +--------------------------------------------------------------+
+      | store         p -&gt; &amp;SymRegion{conj_$0&lt;int *&gt;}                 |
+      | constraints   ...                                             |
+      | generic data map                                              |
+      |   LifetimeBoundMap                                            |
+      |     +------------------------------+---------------------+   |
+      |     | borrowing value              | lifetime sources    |   |
+      |     +------------------------------+---------------------+   |
+      |     | &amp;SymRegion{conj_$0&lt;int *&gt;}   | { y }               |   |
+      |     +------------------------------+---------------------+   |
+      +--------------------------------------------------------------+
+
+  (2) UseAfterLifetimeEnd::checkEndFunction fires on the return
+
+      The checker asks the map what the returned value borrows from and
+      whether those regions belong to the frame that is about to die.
+
+      'y' lives in this frame  -&gt;  warning: Returning value bound to 'y'
+                                   that will go out of scope</code></pre>
+
+                <p>The prototype did all of this in a single checker: it read the annotation, wrote the pair into the state and emitted the warning. That is where the review discussion started, and it settled the shape of everything that came after it.</p>
+
+                <h3>One checker owns the state, the reporting checkers only read it</h3>
+
+                <p>Modeling and reporting have to be separate checkers. Modeling is the shared part and has to be the only writer of the state, because two checkers writing the same entry would make the order of the transitions part of the semantics. Reporting is cheap and specific to one kind of bug, so a new reporting checker can be added without touching the modeling.</p>
+
+                <p><code>LifetimeModeling</code> therefore owns three containers in the generic data map and exposes nothing but queries:</p>
+
+<div class="highlight"><pre><span></span><span class="k">namespace</span><span class="w"> </span><span class="nn">clang</span><span class="o">::</span><span class="nn">ento</span><span class="o">::</span><span class="nn">lifetime_modeling</span><span class="w"> </span><span class="p">{</span>
+<span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="k">const</span><span class="w"> </span><span class="n">MemRegion</span><span class="w"> </span><span class="o">*&gt;</span>
+<span class="n">getDanglingRegionsAfterReturn</span><span class="p">(</span><span class="n">SVal</span><span class="w"> </span><span class="n">Source</span><span class="p">,</span><span class="w"> </span><span class="n">ProgramStateRef</span><span class="w"> </span><span class="n">State</span><span class="p">,</span>
+<span class="w">                              </span><span class="n">CheckerContext</span><span class="w"> </span><span class="o">&amp;</span><span class="n">C</span><span class="p">);</span>
+<span class="kt">bool</span><span class="w"> </span><span class="nf">isDeallocated</span><span class="p">(</span><span class="n">ProgramStateRef</span><span class="w"> </span><span class="n">State</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">MemRegion</span><span class="w"> </span><span class="o">*</span><span class="n">Region</span><span class="p">);</span>
+<span class="kt">bool</span><span class="w"> </span><span class="nf">isBoundToLifetimeSource</span><span class="p">(</span><span class="n">ProgramStateRef</span><span class="w"> </span><span class="n">State</span><span class="p">,</span><span class="w"> </span><span class="n">SVal</span><span class="w"> </span><span class="n">Val</span><span class="p">);</span>
+<span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="nf">getRegionName</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">MemRegion</span><span class="w"> </span><span class="o">*</span><span class="n">Reg</span><span class="p">);</span>
+<span class="n">ProgramStateRef</span><span class="w"> </span><span class="nf">markAsReported</span><span class="p">(</span><span class="n">ProgramStateRef</span><span class="w"> </span><span class="n">State</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">MemRegion</span><span class="w"> </span><span class="o">*</span><span class="n">Region</span><span class="p">);</span>
+<span class="p">}</span><span class="w"> </span><span class="c1">// namespace clang::ento::lifetime_modeling</span>
+</pre></div>
+
+                <p>The two reporting checkers read different parts of the same state and add no tracking of their own:</p>
+
+<pre><code>                        source code + [[clang::lifetimebound]]
+                                        |
+                                        v
+   +--------------------------------------------------------------------+
+   |                          LifetimeModeling                           |
+   |             the only checker that writes program state              |
+   |                                                                     |
+   |   checkPostCall  -------------&gt;  LifetimeBoundMap                   |
+   |     reads the annotation         value -&gt; { source regions }        |
+   |                                                                     |
+   |   checkLifetimeEnd  ----------&gt;  DeallocatedSourceSet               |
+   |     a scope just ended           { regions that are gone }          |
+   |                                                                     |
+   |   checkDeadSymbols  ----------&gt;  drops entries the analyzer         |
+   |                                  can no longer reach                |
+   |                                                                     |
+   |                                  ReportedDeadRegions                |
+   |                                  { already warned about }           |
+   +--------------------------------------------------------------------+
+            ^                                            ^
+            | getDanglingRegionsAfterReturn()            | isDeallocated()
+            | isBoundToLifetimeSource()                  | markAsReported()
+            |                                            |
+   +--------+---------------------+      +---------------+------------------+
+   |     UseAfterLifetimeEnd      |      |         DanglingPtrDeref         |
+   |     check::EndFunction       |      |   check::Location, PostCall      |
+   |                              |      |                                  |
+   |  the value being returned    |      |  a pointer is used and the       |
+   |  still borrows from a local  |      |  object it points to is gone     |
+   +------------------------------+      +----------------------------------+</code></pre>
+
+                <p><code>checkPostCall</code> also records the borrow for an annotated implicit object parameter, so <code>s.data()</code> on a local <code>std::string</code> is tracked the same way a free function call is. The checker implements <code>printState</code> and ships a debug checker with an <code>analyzerDumpLifetimeOriginsOf</code> call, which is how a test shows what the state holds at a given point. That was the single most useful thing I wrote: most of my bugs were not wrong reports but a state that did not hold what I assumed.</p>
+
+                <h3>The reporting checker for the annotation</h3>
+
+                <p><code>UseAfterLifetimeEnd</code> subscribes to <code>check::EndFunction</code>. When the function is about to return a value that the map says borrows from something, it asks the modeling checker which of those sources are dangling stack regions and reports the ones that are.</p>
+
+<div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">test_func</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]]);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">variable_return</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">test_func</span><span class="p">(</span><span class="o">&amp;</span><span class="n">y</span><span class="p">);</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">p</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p>The report names the variable the value is bound to, points at the place where the binding was established and at the place where the lifetime ends:</p>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.UseAfterLifetimeEnd \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text example.cpp</code></pre>
+
+<pre><code>warning: Returning value bound to 'y' that will go out of scope [alpha.cplusplus.UseAfterLifetimeEnd]
+    4 |   int y = 5;
+      |       ~
+    5 |   int *p = test_func(&amp;y);
+    6 |   return p;
+      |   ^~~~~~~~
+note: 'y' initialized here
+    4 |   int y = 5;
+      |   ^~~~~
+note: Value's lifetime bound to the lifetime of 'y' here
+    4 |   int y = 5;
+      |       ~
+    5 |   int *p = test_func(&amp;y);
+      |                      ^~
+note: Lifetime of 'y' ended here
+    4 |   int y = 5;
+      |       ~
+    5 |   int *p = test_func(&amp;y);
+    6 |   return p;
+      |   ^~~~~~~~</code></pre>
+
+                <h3>The end of a lifetime as an event</h3>
+
+                <p><code>DanglingPtrDeref</code> reports the other half of the problem: a pointer used after the object it points to has gone out of scope. It is not annotation driven and it exists because of Arseniy Zaostrovnykh's work on <code>CFGLifetimeEnds</code>, which landed on June 8 just as my coding period started and turned the end of a scope into a <code>checkLifetimeEnd</code> callback instead of something a checker had to infer from the shape of the CFG. <code>LifetimeModeling</code> listens to it and adds the region to <code>DeallocatedSourceSet</code>, and <code>checkPreStmt(DeclStmt)</code> takes it back out when a declaration reuses the same storage in the next loop iteration.</p>
+
+                <p>The reporting side subscribes to <code>check::Location</code> and asks on every load and store through a pointer whether the pointee is gone. That covers a dereference anywhere in the function including one inside a return statement. A return that only passes the pointer along belongs to <code>core.StackAddressEscape</code>.</p>
+
+<div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="nf">use_after_scope</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="w">    </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">num</span><span class="p">;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="o">*</span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text example.cpp</code></pre>
+
+<pre><code>warning: Use of 'num' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
+    7 |   *ptr = 6;
+      |   ~~~~~^~~
+note: 'num' initialized to 5
+    4 |     int num = 5;
+      |     ^~~~~~~
+note: Value assigned to 'ptr'
+    5 |     ptr = &amp;num;
+      |     ^~~~~~~~~~
+note: 'num' is destroyed here
+    6 |   }
+      |   ^
+note: Use of 'num' after its lifetime ended
+    7 |   *ptr = 6;
+    </code></pre>
+
+                <h3>Two blind spots: calls and subobjects</h3>
+
+                <p><code>check::Location</code> alone misses the case where a dangling pointer is handed to another function. The load that happens at a call site is the load of the pointer variable itself, not an access through the pointer, so the callback never sees the dead region. <code>DanglingPtrDeref</code> therefore also implements <code>checkPostCall</code> and inspects every argument, but only when the callee was not inlined: if the analyzer went into the body, <code>checkLocation</code> already covers every dereference in there, and reporting at the call site as well would produce the same bug twice.</p>
+
+<div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="nf">escape</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">ptr</span><span class="p">);</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">passing_dangling_ptr_to_opaque_func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="w">    </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">num</span><span class="p">;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="n">escape</span><span class="p">(</span><span class="n">ptr</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text example.cpp</code></pre>
+
+<pre><code>warning: Use of 'num' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
+    9 |   escape(ptr);
+      |   ^~~~~~~~~~~
+note: 'num' initialized to 5
+    6 |     int num = 5;
+      |     ^~~~~~~
+note: Value assigned to 'ptr'
+    7 |     ptr = &amp;num;
+      |     ^~~~~~~~~~
+note: 'num' is destroyed here
+    8 |   }
+      |   ^
+note: Use of 'num' after its lifetime ended
+    9 |   escape(ptr);
+      |   ^~~~~~~~~~~</code></pre>
+
+                <p>The second blind spot was subobjects. A pointer can point at a field, an array element or a base class subobject, while what the modeling checker recorded as deallocated was the region of the whole object. The fix is that <code>isDeallocated</code> looks up the base region of the region it is asked about, so a pointer into any part of a dead object is recognized as dangling.</p>
+
+<div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">MyBuffer</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">char</span><span class="w"> </span><span class="n">buffer</span><span class="p">[</span><span class="mi">8</span><span class="p">];</span>
+<span class="p">};</span>
+
+<span class="kt">char</span><span class="w"> </span><span class="nf">member_subregion_dangling_deref</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="n">MyBuffer</span><span class="w"> </span><span class="n">tmp_buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{};</span>
+<span class="w">    </span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tmp_buffer</span><span class="p">.</span><span class="n">buffer</span><span class="p">;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text example.cpp</code></pre>
+
+<pre><code>warning: Use of 'tmp_buffer.buffer[0]' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
+   11 |   return *p;
+      |          ^~
+note: Initializing to 0
+    8 |     MyBuffer tmp_buffer = {};
+      |     ^~~~~~~~~~~~~~~~~~~
+note: 'tmp_buffer.buffer[0]' is destroyed here
+   10 |   }
+      |   ^
+note: Use of 'tmp_buffer.buffer[0]' after its lifetime ended
+   11 |   return *p;</code></pre>
+
+                <h3>Running on LLVM</h3>
+
+                <p>Once both checkers passed their own tests I ran them over the LLVM monorepo. It is large, high quality and real, so practically every report is a false positive and the exercise is really a measurement of how much noise the checkers make. Three classes came back.</p>
+
+                <p><strong>A <code>lifetimebound</code> call during destruction.</strong> A destructor is the one place where handing out a borrow of the dying object is normal: the caller is the destructor itself and the borrow does not escape it. The fix walks the frames on the current stack and suppresses the report if any of them is a destructor.</p>
+
+<pre><code>   +-------------------------------------------------+
+   |  Widget::~Widget()          &lt;- destructor frame  |
+   |     Widget::getName()       [[lifetimebound]]    |
+   +-------------------------------------------------+
+      any destructor frame on the stack  -&gt;  no report</code></pre>
+
+                <p><strong>A source owned by another frame.</strong> This produced most of the noise on LLVM. A returned value can only dangle if the frame that owns its lifetime source is the frame being left. When the source belongs to a caller that stays alive, or to a frame the analyzer never entered, the storage outlives the value and there is nothing to report. <code>isDanglingStackSource</code> now keeps only sources owned by the frame being left.</p>
+
+<pre><code>   caller()                          owns 'buf', stays alive
+      |  &amp;buf
+      v
+   helper()  returns a value bound to 'buf'
+      |
+      v  helper's frame dies here, caller's does not
+   no report: the owning frame is still on the stack</code></pre>
+
+                <p><strong>The same variable reported again and again.</strong> Not a wrong report but a repeated one. <code>checkLocation</code> fires on every access through a pointer, so a dead variable used five times produced five warnings that all describe the same bug. <code>markAsReported</code> puts the region into <code>ReportedDeadRegions</code> the first time and returns a null state afterwards, which the reporting checkers treat as "already covered".</p>
+
+<pre><code>   before                        after
+   *p = 1;   warning             *p = 1;   warning
+   *p = 2;   warning             *p = 2;   -
+   use(p);   warning             use(p);   -</code></pre>
+
+                <h3>Making the reports explain themselves</h3>
+
+                <p>A report that only points at the place where the program misbehaves does not tell the user where the bad value came from, and for a lifetime bug the origin is the bug. <code>UseAfterLifetimeEnd</code> got a <code>BugReporterVisitor</code> that adds the note about where the value was bound to its source, and <code>DanglingPtrDeref</code> got <code>trackExpressionValue</code> so that the report walks back to where the dangling value came from. The diagnostics also stopped using <code>getString()</code>, which is a debug only stringification, in favour of <code>getDescriptiveName()</code> behind a shared <code>getRegionName()</code> helper, and the highlighted source ranges were narrowed so that only the annotated parameter is underlined when a function takes several parameters.</p>
+
+                <h3>Documentation</h3>
+
+                <p>Bringing the checkers out of <code>alpha</code> is one of the goals of the project and that requires documentation. Both checkers are now documented in the checker documentation [8], with the examples and the limitations they have today.</p>
+
+                <h2>Patches</h2>
+
+                <p><strong>Modeling and the checkers</strong></p>
+
+                <ul>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/200143" target="_blank">#200143</a> and its reopened version <a href="https://github.com/llvm/llvm-project/pull/200145" target="_blank">#200145</a>: the prototype. Read <code>[[clang::lifetimebound]]</code> in <code>checkPostCall</code> and recorded the borrow in the program state. Not merged; the review discussion on it settled the split between modeling and reporting.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/205521" target="_blank">#205521</a>: implemented the <code>UseAfterLifetimeEnd</code> checker, which reports a value returned from a function while it still borrows from a local of that function.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/205951" target="_blank">#205951</a>: implemented the <code>LifetimeModeling</code> checker and moved all state handling out of <code>UseAfterLifetimeEnd</code> into it, with the query interface in <code>LifetimeModeling.h</code>.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/206460" target="_blank">#206460</a>: the first version of <code>DanglingPtrDeref</code>, superseded by the reviewed version below.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/209278" target="_blank">#209278</a>: implemented <code>DanglingPtrDeref</code>, which subscribes to <code>check::Location</code> and reports a use of a pointer whose pointee has gone out of scope.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/209862" target="_blank">#209862</a>: NFC, corrected the <code>DanglingPtrDeref</code> checker's filename.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/211045" target="_blank">#211045</a>: added <code>checkPostCall</code> to <code>DanglingPtrDeref</code> so a dangling pointer passed as an argument to a non-inlined call is reported.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/211552" target="_blank">#211552</a>: matched dangling subobjects by their base region, so a pointer to a field, an array element or a base class subobject of a dead object is recognized.</li>
+                </ul>
+
+                <p><strong>False positives</strong></p>
+
+                <ul>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/210801" target="_blank">#210801</a>: suppressed the report when a <code>lifetimebound</code> method is called during the destruction of an object.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/211582" target="_blank">#211582</a>: NFC, rewrote the destructor frame walk with <code>llvm::any_of</code>.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/213779" target="_blank">#213779</a>: discarded lifetime sources whose stack frame is no longer live on the current stack. This removed most of the false positives found on the LLVM monorepo.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/215409" target="_blank">#215409</a>: implemented <code>markAsReported</code>, so <code>DanglingPtrDeref</code> reports only the first dereference of a given variable.</li>
+                </ul>
+
+                <p><strong>Diagnostics</strong></p>
+
+                <ul>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/207052" target="_blank">#207052</a>: implemented a <code>BugReporterVisitor</code> for <code>UseAfterLifetimeEnd</code> that adds the note showing where the value's lifetime was bound to its source.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/211818" target="_blank">#211818</a>: added <code>trackExpressionValue</code> to <code>DanglingPtrDeref</code> so the report shows where the dangling value originated.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/212158" target="_blank">#212158</a>: replaced the debug only <code>getString()</code> with <code>getDescriptiveName()</code> in the diagnostics, added the shared <code>getRegionName()</code> helper and switched the path notes to <code>trackStoredValue()</code>.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/215651" target="_blank">#215651</a>: underlined only the parameter that the return value is actually bound to when a function has several parameters.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/215905" target="_blank">#215905</a>: corrected the highlighted range so it matches the variable the note refers to.</li>
+                </ul>
+
+                <p><strong>Documentation</strong></p>
+
+                <ul>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/216688" target="_blank">#216688</a>: documentation for <code>DanglingPtrDeref</code>.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/217122" target="_blank">#217122</a>: documentation for <code>UseAfterLifetimeEnd</code>.</li>
+                </ul>
+
+                <p><strong>Outside the project</strong></p>
+
+                <ul>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/212883" target="_blank">#212883</a>: NFC, matched the parameter order of <code>getEndPath</code> and <code>finalizeVisitor</code> with <code>VisitNode</code>.</li>
+                    <li><a href="https://github.com/llvm/llvm-project/pull/210474" target="_blank">#210474</a>: added <code>[[clang::lifetimebound]]</code> annotations to <code>Twine.h</code>.</li>
+                </ul>
+
+                <p>Arseniy Zaostrovnykh's <a href="https://github.com/llvm/llvm-project/pull/201123" target="_blank">#201123</a>, which added <code>CFGLifetimeEnds</code> handling and the <code>checkLifetimeEnd</code> callback, is not my patch but <code>DanglingPtrDeref</code> is built on it.</p>
+
+                <p>Paste above the diagnostic output in "The pointer only dangles on one path". The mentor asked for one visualization, and this is the claim the whole project makes.</p>
+
+<pre><code>        chosen = select(&amp;computed, &amp;fallback, width &gt; 0)
+                          /                \
+         width &gt; 0 true  /                  \  width &gt; 0 false
+                        v                    v
+          chosen -&gt; computed            chosen -&gt; fallback
+                        |                    |
+     }  &lt;-- computed's lifetime ends         |   (fallback outlives the block)
+                        |                    |
+                 *chosen += 1           *chosen += 1
+                        |                    |
+                     WARNING                 ok
+
+   -Wlifetime-safety sees one function and one merged answer.
+   The CSA keeps the two paths apart, so it reports the left one
+   and prints the condition that leads there.</code></pre>
+
+                <h2>Results</h2>
+
+                <p>None of the three cases below is caught by <code>-Wlifetime-safety</code> or by the CSA running its <code>core</code> checkers. Each one is caught by one of the two new lifetime checkers, as the run under every example shows.</p>
+
+                <h3>The annotated function cannot be inlined</h3>
+
+<div class="highlight"><pre><span></span><span class="c1">// Defined in another translation unit.</span>
+<span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="nf">findOption</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">config</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]],</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">key</span><span class="p">);</span>
+
+<span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="nf">optionValue</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">key</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">findOption</span><span class="p">(</span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="n">key</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="nf">readTimeout</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">char</span><span class="w"> </span><span class="n">config</span><span class="p">[</span><span class="mi">64</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;timeout=30&quot;</span><span class="p">;</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">optionValue</span><span class="p">(</span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;timeout&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p><code>findOption</code> is only declared so there is no body to inline, and <code>optionValue</code> carries no annotation of its own. The CSA inlines <code>optionValue</code>, hits the annotated call inside it and falls back on the contract. The report names <code>config[0]</code> because that is the region the array decays to at the call.</p>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.UseAfterLifetimeEnd \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text config-lookup.cpp</code></pre>
+
+<pre><code>warning: Returning value bound to 'config[0]' that will go out of scope [alpha.cplusplus.UseAfterLifetimeEnd]
+   10 |   return optionValue(config, "timeout");
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: Calling 'optionValue'
+   10 |   return optionValue(config, "timeout");
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: Value's lifetime bound to the lifetime of 'config[0]' here
+    5 |   return findOption(config, key);
+      |                     ^~~~~~
+note: Returning from 'optionValue'
+   10 |   return optionValue(config, "timeout");
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: Lifetime of 'config[0]' ended here
+   10 |   return optionValue(config, "timeout");
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~</code></pre>
+
+                <h3>The pointer dangles on one path only</h3>
+
+<div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">pickBuffer</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">scratch</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">shared</span><span class="p">,</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="n">useScratch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">useScratch</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">scratch</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">shared</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">resize</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">width</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">shared</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">scratch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">width</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">    </span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pickBuffer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">scratch</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">shared</span><span class="p">,</span><span class="w"> </span><span class="n">width</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="o">*</span><span class="n">buffer</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p><code>buffer</code> is dangling only when <code>width &gt; 0</code> holds. On the other path it points to <code>shared</code>, which outlives the block, so a single merged answer for the function has to be either silent or wrong.</p>
+
+<pre><code>        buffer = pickBuffer(&amp;scratch, &amp;shared, width &gt; 0)
+                       /                         \
+      width &gt; 0 true  /                           \  width &gt; 0 false
+                     v                             v
+        buffer -&gt; scratch                   buffer -&gt; shared
+                     |                             |
+   }  &lt;- scratch dies here                         |  shared outlives the block
+                     |                             |
+             *buffer += 1                    *buffer += 1
+                     |                             |
+                  WARNING                          ok</code></pre>
+
+                <p>The CSA keeps the two paths apart, reports the left one and prints the condition that leads there.</p>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text pick-buffer.cpp</code></pre>
+
+<pre><code>warning: Use of 'scratch' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
+   12 |   *buffer += 1;
+      |   ~~~~~~~~^~~~
+note: 'scratch' initialized here
+    9 |     int scratch = width * 2;
+      |     ^~~~~~~~~~~
+note: Assuming 'width' is &gt; 0
+   10 |     buffer = pickBuffer(&amp;scratch, &amp;shared, width &gt; 0);
+      |                                            ^~~~~~~~~
+note: Passing value via 1st parameter 'scratch'
+   10 |     buffer = pickBuffer(&amp;scratch, &amp;shared, width &gt; 0);
+      |                         ^~~~~~~~
+note: Calling 'pickBuffer'
+   10 |     buffer = pickBuffer(&amp;scratch, &amp;shared, width &gt; 0);
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: 'useScratch' is true
+    2 |   return useScratch ? scratch : shared;
+      |          ^~~~~~~~~~
+note: '?' condition is true
+note: Returning pointer
+    2 |   return useScratch ? scratch : shared;
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: Returning from 'pickBuffer'
+   10 |     buffer = pickBuffer(&amp;scratch, &amp;shared, width &gt; 0);
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: Value assigned to 'buffer'
+   10 |     buffer = pickBuffer(&amp;scratch, &amp;shared, width &gt; 0);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+note: 'scratch' is destroyed here
+   11 |   }
+      |   ^
+note: Use of 'scratch' after its lifetime ended
+   12 |   *buffer += 1;
+      |   ~~~~~~~~^~~~</code></pre>
+
+                <h3>The borrow is created inside another function</h3>
+
+<div class="highlight"><pre><span></span><span class="kt">void</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">sample</span><span class="p">);</span>
+
+<span class="k">const</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">keep</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">value</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">value</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">collectSample</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">reading</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">sample</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">corrected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">reading</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="n">sample</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">keep</span><span class="p">(</span><span class="o">&amp;</span><span class="n">corrected</span><span class="p">);</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="n">submit</span><span class="p">(</span><span class="n">sample</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p><code>keep</code> carries no annotation, and <code>sample</code> is never dereferenced in <code>collectSample</code>, it is only handed to <code>submit</code>. The CSA inlines <code>keep</code>, follows the pointer back to <code>corrected</code> and reports the call that passes it on.</p>
+
+<pre><code>$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text collect-sample.cpp</code></pre>
+
+<pre><code>warning: Use of 'corrected' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
+   11 |   submit(sample);
+      |   ^~~~~~~~~~~~~~
+note: 'corrected' initialized here
+    8 |     int corrected = reading + 1;
+      |     ^~~~~~~~~~~~~
+note: Passing value via 1st parameter 'value'
+    9 |     sample = keep(&amp;corrected);
+      |                   ^~~~~~~~~~
+note: Value assigned to 'sample'
+    9 |     sample = keep(&amp;corrected);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~
+note: 'corrected' is destroyed here
+   10 |   }
+      |   ^
+note: Use of 'corrected' after its lifetime ended
+   11 |   submit(sample);
+      |   ^~~~~~~~~~~~~~</code></pre>
+
+                <h2>Future work</h2>
+
+                <p><strong>Support for <code>LazyCompoundVal</code>.</strong> <code>std::string_view</code> and <code>std::span</code> are among the types the annotations are written on. They are class types returned by value, which the analyzer represents as a <code>LazyCompoundVal</code> and none of the maps in the modeling checker cover that today, so the lifetime origin is lost:</p>
+
+<div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">View</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="p">;</span><span class="w"> </span><span class="p">};</span>
+<span class="n">View</span><span class="w"> </span><span class="nf">makeView</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">&amp;</span><span class="n">x</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]]);</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">caller_view</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span><span class="p">;</span>
+<span class="w">  </span><span class="n">View</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">makeView</span><span class="p">(</span><span class="n">v</span><span class="p">);</span>
+<span class="w">  </span><span class="c1">// FIXME: Currently none of the maps cover LazyCompoundVal.</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p>Covering it brings the checkers to the code the annotations were introduced for.</p>
+
+                <p><strong>Interoperability with the <code>MallocChecker</code>.</strong> Both checkers reason about stack regions only, so a lifetime source that lives on the heap is out of their reach. The plan is to extend them to heap sources through the interface the <code>MallocChecker</code> already exposes for this in <code>AllocationState.h</code>, which is how <code>cplusplus.InnerPointer</code> works with it today, instead of modeling the heap in the lifetime checkers.</p>
+
+                <p><strong>The <code>[[clang::lifetime_capture_by(X)]]</code> annotation.</strong> The original proposal covered both annotations. During the summer I have prioritized <code>[[clang::lifetimebound]]</code>, because it is the annotation people actually use. In the LLVM monorepo alone libc++ applies <code>_LIBCPP_LIFETIMEBOUND</code> around 80 times across 22 headers, while <code>lifetime_capture_by</code> does not appear in the library at all, and outside LLVM the same asymmetry holds: Abseil ships <code>ABSL_ATTRIBUTE_LIFETIME_BOUND</code> [9] and uses it throughout its string and container types, while <code>lifetime_capture_by</code> is a much newer addition [10]. Supporting the capture annotation is the work I intend to do after the summer.</p>
+
+                <p><strong>Maintenance.</strong> I intend to maintain these checkers. That means fixing the false positives that will show up once people enable them on their own code bases, moving them out of <code>alpha</code> once they are stable enough, and continuing to contribute to the Clang Static Analyzer in general.</p>
+
+                <h2>Special thanks</h2>
+
+                <h2>References</h2>
+
+                <p>[1] National Security Agency, "Software Memory Safety", Cybersecurity Information Sheet, November 2022. <a href="https://media.defense.gov/2022/Nov/10/2003112742/-1/-1/0/CSI_SOFTWARE_MEMORY_SAFETY.PDF" target="_blank">https://media.defense.gov/2022/Nov/10/2003112742/-1/-1/0/CSI_SOFTWARE_MEMORY_SAFETY.PDF</a></p>
+
+                <p>[2] M. Miller, "Trends, Challenges, and Strategic Shifts in the Software Vulnerability Mitigation Landscape", BlueHat IL, February 2019. <a href="https://github.com/microsoft/MSRC-Security-Research" target="_blank">https://github.com/microsoft/MSRC-Security-Research</a></p>
+
+                <p>[3] The Chromium Projects, "Memory safety". <a href="https://www.chromium.org/Home/chromium-security/memory-safety/" target="_blank">https://www.chromium.org/Home/chromium-security/memory-safety/</a></p>
+
+                <p>[4] Office of the National Cyber Director, "Back to the Building Blocks: A Path Toward Secure and Measurable Software", February 2024.</p>
+
+                <p>[5] B. Stroustrup, "A call to action: Think seriously about 'safety'; then do something sensible about it", P2739R0, December 2022. <a href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2739r0.pdf" target="_blank">https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2739r0.pdf</a></p>
+
+                <p>[6] H. Sutter, "Lifetime safety: Preventing common dangling", P1179R1, version 1.1, November 2019. <a href="https://github.com/isocpp/CppCoreGuidelines/blob/master/docs/Lifetime.pdf" target="_blank">https://github.com/isocpp/CppCoreGuidelines/blob/master/docs/Lifetime.pdf</a></p>
+
+                <p>[7] U. Saxena, D. Hrybenko, Y. Mandelbaum, J. Voung and K. Yasuda, "[RFC] Intra-procedural lifetime analysis in Clang", LLVM Discussion Forums, May 2025. <a href="https://discourse.llvm.org/t/rfc-intra-procedural-lifetime-analysis-in-clang/86291" target="_blank">https://discourse.llvm.org/t/rfc-intra-procedural-lifetime-analysis-in-clang/86291</a></p>
+
+                <p>[8] Clang documentation, "Available Checkers". <a href="https://clang.llvm.org/docs/analyzer/checkers.html" target="_blank">https://clang.llvm.org/docs/analyzer/checkers.html</a></p>
+
+                <p>[9] Abseil, definition of <code>ABSL_ATTRIBUTE_LIFETIME_BOUND</code> in <code>absl/base/attributes.h</code>. <a href="https://github.com/abseil/abseil-cpp/blob/master/absl/base/attributes.h" target="_blank">https://github.com/abseil/abseil-cpp/blob/master/absl/base/attributes.h</a></p>
+
+                <p>[10] G. Horvath and U. Saxena, "[RFC] Introduce <code>[[clang::lifetime_capture_by(X)]]</code>", LLVM Discussion Forums, November 2024. <a href="https://discourse.llvm.org/t/rfc-introduce-clang-lifetime-capture-by-x/81371" target="_blank">https://discourse.llvm.org/t/rfc-introduce-clang-lifetime-capture-by-x/81371</a></p>
+            </section>
+            <footer>
+                <p>
+                    <small>Hosted on GitHub Pages &mdash; Theme by
+                        <a href="https://github.com/orderedlist" target="_blank">orderedlist</a></small>
+                </p>
+            </footer>
+        </div>
+        <script src="javascripts/scale.fix.js"></script>
+    </body>
+</html>
