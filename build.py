@@ -68,8 +68,14 @@ def inline(text):
     text = re.sub(r"`([^`]+)`", code, text)
     text = html.escape(text, quote=False)
 
+    def image(m):
+        alt, src = m.group(1), m.group(2)
+        return stash('<img src="%s" alt="%s" style="max-width:100%%" />' % (src, alt))
+
+    text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", image, text)
+
     def link(m):
-        label, url = m.group(1), html.escape(m.group(2), quote=True)
+        label, url = m.group(1), m.group(2)
         return stash('<a href="%s" target="_blank">%s</a>' % (url, label))
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, text)
