@@ -1,4 +1,4 @@
-# Teach the Clang Static Analyzer to understand lifetime annotations
+# [Teach the Clang Static Analyzer to understand lifetime annotations](https://benedekaibas.github.io/2026-GSoC-LLVM-Final-Report/)
 
 **[Google Summer of Code 2026](https://summerofcode.withgoogle.com/programs/2026/projects/FVArxbU6) @ [LLVM Compiler Infrastructure](https://llvm.org/)**
 
