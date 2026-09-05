@@ -62,9 +62,9 @@ int *variable_return() {
 The two nodes below are consecutive in the ExplodedGraph and sit at the same program point. State 603 is the engine having evaluated the call. State 550 is one
 node later, after `LifetimeModeling` ran, and it carries the borrow as `Origin ... contains Loan y`.
 
-![State 603, the call has been evaluated and there is no lifetime state yet](ProgramState-603.png)
+![State 603, the call has been evaluated and there is no lifetime state yet](img/ProgramState-603.png)
 
-![State 550, checkPostCall has recorded the borrow](ProgramState-550.png)
+![State 550, checkPostCall has recorded the borrow](img/ProgramState-550.png)
 
 ## One writer for the state
 

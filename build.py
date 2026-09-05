@@ -191,6 +191,14 @@ def main():
         "",
     ])
     body = render_body(parse("\n".join(lines[start:])))
+    # pair up consecutive image paragraphs so the two graph nodes sit side by side
+    body = re.sub(
+        r'\s*<p>(<img [^>]*/>)</p>\s*\n\s*<p>(<img [^>]*/>)</p>',
+        lambda m: ('\n<div style="display:flex;gap:14px;align-items:flex-start">'
+                   '<div style="flex:1">%s</div><div style="flex:1">%s</div></div>\n'
+                   % (m.group(1), m.group(2))),
+        body)
+
     out = head + intro + body + FOOT
 
     with open(os.path.join(HERE, "index.html"), "w", encoding="utf-8") as f:

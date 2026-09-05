@@ -72,10 +72,8 @@
 </pre></div>
 
                 <p>The two nodes below are consecutive in the ExplodedGraph and sit at the same program point. State 603 is the engine having evaluated the call. State 550 is one node later, after <code>LifetimeModeling</code> ran, and it carries the borrow as <code>Origin ... contains Loan y</code>.</p>
+<div style="display:flex;gap:14px;align-items:flex-start"><div style="flex:1"><img src="img/ProgramState-603.png" alt="State 603, the call has been evaluated and there is no lifetime state yet" style="max-width:100%" /></div><div style="flex:1"><img src="img/ProgramState-550.png" alt="State 550, checkPostCall has recorded the borrow" style="max-width:100%" /></div></div>
 
-                <p><img src="ProgramState-603.png" alt="State 603, the call has been evaluated and there is no lifetime state yet" style="max-width:100%" /></p>
-
-                <p><img src="ProgramState-550.png" alt="State 550, checkPostCall has recorded the borrow" style="max-width:100%" /></p>
 
                 <h2>One writer for the state</h2>
 
