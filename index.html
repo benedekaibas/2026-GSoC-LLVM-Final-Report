@@ -27,7 +27,7 @@
                 </p>
                 <h2>Motivation</h2>
 
-                <p>Clang can warn about lifetime bugs. Behind <code>-Wlifetime-safety</code> [1] it reads the lifetime annotations a function carries and reports a pointer or a reference that outlives the object it refers to when it escapes the function or the dead object is accessed through it. The analysis runs on every translation unit of every build and examines one function at a time, so an unannotated call is treated optimistically as having no lifetime effects: the origin of the value is lost at the call and bugs that depend on it go unreported. This project extends the Clang Static Analyzer (later referred to as CSA) to cover those cases. It reads the same annotations and follows the value through the calls the compiler cannot enter, and the two checkers that came out of it are in Clang today, reporting bugs the compiler does not.</p>
+                <p>Clang can warn about lifetime bugs. Behind <code>-Wlifetime-safety</code> [1] it reads the lifetime annotations a function carries and reports a warning when a pointer or a reference that outlives the object it refers to escapes the function, or when the dead object is accessed through it. The analysis runs on every translation unit of every build and examines one function at a time, so an unannotated call is treated optimistically as having no lifetime effects: the origin of the value is lost at the call and bugs that depend on it go unreported. This project extends the Clang Static Analyzer (later referred to as CSA) to cover those cases. It reads the same annotations and follows the value through the calls the compiler cannot enter, and the three checkers that came out of it are in Clang today, reporting bugs the compiler does not.</p>
 
                 <h2>Patches</h2>
 
@@ -57,23 +57,41 @@
 
                 <h2>From an attribute to a report</h2>
 
-                <p>Nothing can be reported before the <strong>Clang Static Analyzer</strong> records where a value borrows from, so that recording came first. Clang attaches <code>[[clang::lifetimebound]]</code> to the annotated <code>ParmVarDecl</code>, so the contract is in the AST before the analyzer starts. It becomes usable in <code>checkPostCall</code>: the call has been evaluated, so the return value and every argument have an <code>SVal</code> and the checker can pair the returned value with the region of the argument it borrows from. That pair goes into the <code>ProgramState</code>, the object the analyzer carries from node to node and a state belongs to one node.</p>
+                <p>Nothing can be reported before the <strong>Clang Static Analyzer</strong> records where a value borrows from, so that recording came first.</p>
+
+<div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">test_func</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]]);</span>
+</pre></div>
+
+                <p>Clang attaches <code>[[clang::lifetimebound]]</code> to the annotated <code>ParmVarDecl</code>, so the contract is in the AST before the analyzer starts.</p>
 
 <div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">test_func</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]]);</span>
 
 <span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">variable_return</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
 <span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
-<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">test_func</span><span class="p">(</span><span class="o">&amp;</span><span class="n">y</span><span class="p">);</span><span class="w">   </span><span class="c1">// checkPostCall records that the result borrows from &#39;y&#39;</span>
-<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">p</span><span class="p">;</span><span class="w">                 </span><span class="c1">// checkEndFunction reports here:</span>
-<span class="w">                            </span><span class="c1">// warning: Returning value bound to &#39;y&#39; that will go out of scope</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">test_func</span><span class="p">(</span><span class="o">&amp;</span><span class="n">y</span><span class="p">);</span><span class="w"> </span><span class="c1">// checkPostCall records that the result borrows from &#39;y&#39;</span>
+<span class="w">  </span><span class="c1">// ...</span>
 <span class="p">}</span>
 </pre></div>
 
-                <p>The two nodes below are consecutive in the ExplodedGraph and sit at the same program point. State 603 is the engine having evaluated the call. State 550 is one node later, after <code>LifetimeModeling</code> ran, and it carries the borrow as <code>Origin ... contains Loan y</code>.</p>
+                <p>In <code>checkPostCall</code> the call has been evaluated, so the return value has an <code>SVal</code> and the checker can pair it with the region of the argument it borrows from. That pair goes into the <code>ProgramState</code>, the object the analyzer carries from node to node, and a state belongs to one node.</p>
+
+<div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">test_func</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="p">[[</span><span class="n">clang</span><span class="o">::</span><span class="n">lifetimebound</span><span class="p">]]);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="nf">variable_return</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">test_func</span><span class="p">(</span><span class="o">&amp;</span><span class="n">y</span><span class="p">);</span><span class="w"> </span><span class="c1">// checkPostCall records that the result borrows from &#39;y&#39;</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">p</span><span class="p">;</span><span class="w">               </span><span class="c1">// checkEndFunction callback reports here:</span>
+<span class="w">                          </span><span class="c1">// warning: Returning value bound to &#39;y&#39; that will go out of scope</span>
+<span class="p">}</span>
+</pre></div>
+
+                <p>The <code>checkEndFunction</code> callback asks the state what the returned value borrows from and whether those regions belong to the frame that is about to die.</p>
+
+                <p>The two nodes below are consecutive in the <code>ExplodedGraph</code> and sit at the same program point. State 603 is the engine having evaluated the call. State 550 is one node later, after <code>LifetimeModeling</code> ran, and it carries the borrow as <code>Origin ... contains Loan y</code>.</p>
 <div style="display:flex;gap:14px;align-items:flex-start"><div style="flex:1"><img src="img/ProgramState-603.png" alt="State 603, the call has been evaluated and there is no lifetime state yet" style="max-width:100%" /></div><div style="flex:1"><img src="img/ProgramState-550.png" alt="State 550, checkPostCall has recorded the borrow" style="max-width:100%" /></div></div>
 
 
-                <p><code>-Wlifetime-safety</code> is intra-procedural by default and path-insensitive: it analyzes one function at a time and merges the states that meet at a join, so a borrow taken on one branch is indistinguishable from one taken on the other. The analyzer performs an inter-procedural and path-sensitive analysis: it can enter a callee whose body is available (if the analyzer's budget allows it) and explores each path separately, so what it records on one path never shows up on the other.</p>
+                <p><code>-Wlifetime-safety</code> is intra-procedural by default and path-insensitive: it analyzes one function at a time and merges the states at a join point (where branches meet), so a borrow taken on one branch is indistinguishable from one taken on the other. The analyzer performs an inter-procedural and path-sensitive analysis: it can enter a callee whose body is available (if the analyzer's budget allows it) and explores each path separately, so what it records on one path never shows up on the other.</p>
 
                 <h2>One writer for the state</h2>
 
@@ -99,7 +117,7 @@
 
                 <h2>Catching use after the scope ends</h2>
 
-                <p>The annotated case was now covered. The second kind of lifetime error needs no annotation at all: a pointer used after the object it points to has gone out of scope. While the modelling was taking shape in June, Arseniy Zaostrovnykh and Tomasz Kamnski added <code>CFGLifetimeEnds</code> handling to the analyzer, which turns every end of a scope into a <code>checkLifetimeEnd</code> event and lets the CSA reason about lifetimes directly. I picked it up as soon as it landed and built <code>DanglingPtrDeref</code> on top of it. <code>LifetimeModeling</code> listens to that event and adds the region to <code>DeallocatedSourceSet</code>. <code>checkPreStmt(DeclStmt)</code> clears a variable's region from that set whenever its declaration is executed, so a stale entry cannot make fresh storage look dead.</p>
+                <p>The annotated case is now covered. The second kind of lifetime error needs no annotations at all: a pointer used after the object it points to has gone out of scope. While the modelling was taking shape in June, Arseniy Zaostrovnykh and Tomasz Kaminski added <code>CFGLifetimeEnds</code> handling to the analyzer, which turns every end of a scope into a <code>checkLifetimeEnd</code> event and lets the CSA reason about lifetimes directly <a href="https://github.com/llvm/llvm-project/pull/201123" target="_blank">#201123</a>. I picked it up as soon as it landed and built <code>DanglingPtrDeref</code> on top of it. <code>LifetimeModeling</code> listens to that event and adds the region to <code>DeallocatedSourceSet</code>. <code>checkPreStmt(DeclStmt)</code> clears a variable's region from that set whenever its declaration is executed, so a stale entry cannot make fresh storage look dead.</p>
 
                 <p><code>DanglingPtrDeref</code> subscribes to <code>check::Location</code> and asks on every load and store through a pointer whether the pointee is gone.</p>
 
@@ -145,7 +163,7 @@
 
                 <h2>A pointer into part of a dead object</h2>
 
-                <p>So far we only talked about primitive types, but there are aggregates and, in C++, inheritance as well. A pointer can point at a field, an array element or a base class subobject, while what the modeling checker recorded as deallocated was the region of the whole object. <code>isDeallocated</code> now looks up the base region of the region it is asked about, so a pointer into any part of a dead object is recognized as dangling.</p>
+                <p>So far we only talked about primitive types, but there are aggregates and, in C++, inheritance as well. A pointer can point at a field, an array element or a base class subobject, while what the modeling checker recorded as deallocated was the region of the whole object.</p>
 
 <div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">MyBuffer</span><span class="w"> </span><span class="p">{</span>
 <span class="w">  </span><span class="kt">char</span><span class="w"> </span><span class="n">buffer</span><span class="p">[</span><span class="mi">8</span><span class="p">];</span>
@@ -161,23 +179,27 @@
 <span class="p">}</span>
 </pre></div>
 
-                <p><code>p</code> points at the first element of the array inside <code>tmp_buffer</code>, not at <code>tmp_buffer</code> itself, while <code>checkLifetimeEnd</code> records the region of the whole variable that died. The lookup for the element region therefore missed the entry. <code>isDeallocated</code> now asks for the base region first, which walks the element up through the field to <code>tmp_buffer</code> and finds it.</p>
+                <p><code>p</code> points at the first element of the array inside <code>tmp_buffer</code>, not at <code>tmp_buffer</code> itself, while <code>checkLifetimeEnd</code> records the region of the whole variable that died. <code>isDeallocated</code>, the query the reporting checkers use to ask whether a region is dead, now looks up the base region of the region it is asked about, which walks the element up through the field to <code>tmp_buffer</code> and finds it:</p>
 
-<pre><code>   p = tmp_buffer.buffer;   -&gt;   p points at   ElementRegion  tmp_buffer.buffer[0]
-                                                     |
-                                  getBaseRegion()    |   FieldRegion  tmp_buffer.buffer
-                                                     v
-                                                VarRegion  tmp_buffer
+<pre><code>   p = tmp_buffer.buffer;
 
-   checkLifetimeEnd records the region of the variable that died:  { tmp_buffer }
-   a lookup of the element region misses it, so isDeallocated asks for the base
-   region first and finds the entry</code></pre>
+   p points at     ElementRegion  tmp_buffer.buffer[0]  ---+
+                         |                                 |
+                         v                                 |
+                   FieldRegion    tmp_buffer.buffer        |  getBaseRegion()
+                         |                                 |
+                         v                                 |
+                   VarRegion      tmp_buffer  &lt;------------+</code></pre>
+
+                <p>Before this change the checker only recognized pointers to whole variables, so a pointer into a field, an array element or a base class subobject went unreported. Also this change costs nothing in precision, because a subobject cannot outlive the object that contains it: if <code>tmp_buffer</code> is gone, every region inside it is gone with it.</p>
 
                 <h2>Testing the lifetime checkers</h2>
 
-                <p>Running the checkers on a real project does two things. It shows they hold up outside the cases I wrote tests for and it measures the property that decides whether a checker can stop being experimental: how rarely it reports something that is not a bug. A core checker is expected to have very few false positives and that number cannot come from a hand written suite. The LLVM monorepo is large, actively maintained and heavily reviewed, so it exercises shapes my tests never reach. Every report there has to be read on its own and the ones I went through fell into three classes each a place where the model was too coarse. Closing them made both checkers more precise and moved them closer to the bar a core checker has to meet.</p>
+                <p>Running the checkers on a real project does two things. It shows they hold up outside the cases I wrote tests for and it measures the property that decides whether a checker can stop being experimental: how rarely it reports something that is not a bug (false positive). A core checker is expected to have very few false positives and that number cannot come from a hand written suite. The LLVM monorepo is large, actively maintained and heavily reviewed, so it exercises shapes my tests never reach. Every report there has to be read on its own and the ones I went through fell into three classes, each a place where the model was too coarse. Closing them made both checkers more precise and moved them closer to the bar a core checker has to meet.</p>
 
-                <p><strong>A <code>lifetimebound</code> call during destruction.</strong> A destructor is the one place where handing out a borrow of the dying object is normal: the caller is the destructor itself and the borrow does not escape it. The fix walks the frames on the current stack and suppresses the report if any of them is a destructor, which is coarse on purpose: it asks whether a destructor is on the stack, not whether the borrow belongs to the object being destroyed, so a function called from a destructor that returns a borrow of its own local goes unreported.</p>
+                <h3>A <code>lifetimebound</code> call during destruction</h3>
+
+                <p>A destructor is the one place where handing out a borrow of the dying object is normal: the caller is the destructor itself and the borrow does not escape it. The fix walks the frames on the current stack and suppresses the report if any of them is a destructor, which is coarse on purpose: it asks whether a destructor is on the stack, not whether the borrow belongs to the object being destroyed, so a function called from a destructor that returns a borrow of its own local goes unreported.</p>
 
 <pre><code>   struct S {                                             call stack
      int x;
@@ -195,7 +217,9 @@
    a destructor frame is on the stack, so the borrow get() hands out is meant to die
    with the object  -&gt;  no report</code></pre>
 
-                <p><strong>A source owned by another frame.</strong> This was the largest of the three classes. A returned value can only dangle if the frame that owns its lifetime source is the frame being left. When the source belongs to a caller that stays alive, or to a frame the analyzer never entered, the storage outlives the value and there is nothing to report.</p>
+                <h3>A source owned by another frame</h3>
+
+                <p>This was the largest of the three classes. A returned value can only dangle if the frame that owns its lifetime source is the frame being left. When the source belongs to a caller that stays alive, or to a frame the analyzer never entered, the storage outlives the value and there is nothing to report.</p>
 
 <pre><code>   const char *first(const char *buf [[clang::lifetimebound]]);
    void use(const char *p);                                  call stack
@@ -211,7 +235,9 @@
 
    'buf' belongs to caller(), which stays alive when helper() returns  -&gt;  no report</code></pre>
 
-                <p><strong>The same variable reported again and again.</strong> <code>checkLocation</code> fires on every access through a pointer, so a dead variable used five times produced five warnings that all describe the same bug. <code>markAsReported</code> keeps the first and drops the rest.</p>
+                <h3>The same variable reported again and again</h3>
+
+                <p><code>checkLocation</code> fires on every access through a pointer, so a dead variable used five times produced five warnings that all describe the same bug. <code>markAsReported</code> keeps the first and drops the rest.</p>
 
 <pre><code>   before                        after
    *p = 1;   warning             *p = 1;   warning
@@ -309,13 +335,13 @@
 
                 <p><strong>Interoperability with the <code>MallocChecker</code>.</strong> Both checkers reason about stack regions, so a lifetime source that lives on the heap is out of their reach. The plan is to extend them to heap sources through the interface the <code>MallocChecker</code> already exposes for this in <code>AllocationState.h</code>, which is how <code>cplusplus.InnerPointer</code> works with it today, instead of modeling the heap in the lifetime checkers.</p>
 
-                <p><strong>The <code>[[clang::lifetime_capture_by(X)]]</code> annotation.</strong> The original proposal covered both annotations. During the summer I have prioritized <code>[[clang::lifetimebound]]</code>, because it is the annotation people currently use. In the LLVM monorepo alone libc++ applies <code>_LIBCPP_LIFETIMEBOUND</code> around 80 times across 22 headers, while <code>lifetime_capture_by</code> does not appear in the library at all, and outside LLVM the same asymmetry holds: Abseil ships <code>ABSL_ATTRIBUTE_LIFETIME_BOUND</code> [2] and uses it throughout its string and container types, while <code>lifetime_capture_by</code> is a much newer addition [3]. Supporting the capture annotation is the work I intend to do after the summer.</p>
+                <p><strong>The <code>[[clang::lifetime_capture_by(X)]]</code> annotation.</strong> The original proposal covered both annotations. During the summer I have prioritized <code>[[clang::lifetimebound]]</code>, because it is the annotation people currently use. In the LLVM monorepo alone libc++ applies <code>_LIBCPP_LIFETIMEBOUND</code> around 80 times across 22 headers, while <code>lifetime_capture_by</code> does not appear in the library at all, and outside LLVM the same asymmetry holds: Abseil ships <code>ABSL_ATTRIBUTE_LIFETIME_BOUND</code> [2] and uses it throughout its string and container implementations, while <code>lifetime_capture_by</code> is a much newer addition [3]. Supporting the capture annotation is the work I intend to do after the summer.</p>
 
                 <h2>Special thanks</h2>
 
                 <p>I would like to say thank you to my mentors, in the order they appear on the LLVM GSoC page: Gábor Horváth, Balázs Benics and Dániel Domján, for mentoring this project, for the reviews and design discussions that shaped both checkers and for answering my questions throughout the summer. The time they put into the project and into teaching me went well beyond what I expected. My questions were answered quickly and my patches were reviewed even at weekends. This was the greatest summer of my life so far without a doubt. I am grateful for the opportunity and for my mentors for all their help and guidance. This project gave me a huge motivation to stay active in the LLVM community and continue working on the lifetime checkers and the Clang Static Analyzer.</p>
 
-                <p>I would also like to say thank you to Donát Nagy for his code reviews on some of these patches and to Arseniy Zaostrovnykh and Tomasz Kamnski for the <code>CFGLifetimeEnds</code> support in the CFG.</p>
+                <p>I would also like to say thank you to Donát Nagy for his code reviews on some of these patches and to Arseniy Zaostrovnykh and Tomasz Kaminski for the <code>CFGLifetimeEnds</code> support in the CFG.</p>
 
                 <h2>References</h2>
 
